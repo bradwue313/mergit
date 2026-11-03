@@ -1,7 +1,7 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { network } from "hardhat";
-import { parseEther, keccak256, toHex } from "viem";
+import { parseEther, keccak256, toHex, toFunctionSelector } from "viem";
 
 const FEE_BPS = 150n; // 1.5% — la comisión que anuncia el pitch
 const BPS = 10_000n;
@@ -256,5 +256,99 @@ describe("MergitEscrow", async () => {
     const [payout, fee] = await escrow.read.quote([parseEther("1")]);
     assert.equal(fee, (parseEther("1") * FEE_BPS) / BPS);
     assert.equal(payout, parseEther("1") - fee);
+  });
+
+  // ── ataques a la guardia de reentrada ─────────────────────────
+
+  describe("guardia de reentrada", () => {
+    const MODO_SETTLE = 1;
+    const MODO_REFUND = 2;
+    const SELECTOR_REENTRANCY = toFunctionSelector("Reentrancy()");
+    const EVIDENCIA = keccak256(toHex("ataque-reentrada"));
+    const MONTOS = [0n, parseEther("1"), parseEther("2"), parseEther("3"), parseEther("4")];
+    const SALDO_INICIAL_ESCROW = MONTOS[1] + MONTOS[2] + MONTOS[3] + MONTOS[4];
+    const calcularComision = (monto) => (monto * FEE_BPS) / BPS;
+
+    let atacante;
+
+    beforeEach(async () => {
+      atacante = await viem.deployContract("AtacanteReentrada", [escrow.address]);
+
+      const plazoCorto = await futureDeadline(300);
+      const plazoLargo = await futureDeadline(86_400);
+
+      // Bounties 1 y 2 vencen pronto (para probar refund); 3 y 4 siguen en plazo (para probar settle).
+      await atacante.write.publicarBounty([atacante.address, plazoCorto, "b1"], { value: MONTOS[1] });
+      await atacante.write.publicarBounty([atacante.address, plazoCorto, "b2"], { value: MONTOS[2] });
+      await atacante.write.publicarBounty([atacante.address, plazoLargo, "b3"], { value: MONTOS[3] });
+      await atacante.write.publicarBounty([atacante.address, plazoLargo, "b4"], { value: MONTOS[4] });
+
+      await networkHelpers.time.increaseTo(Number(plazoCorto) + 1);
+      assert.equal(await publicClient.getBalance({ address: escrow.address }), SALDO_INICIAL_ESCROW);
+    });
+
+    const ESCENARIOS = [
+      ["settle -> settle sobre el mismo bounty", MODO_SETTLE, 3n, MODO_SETTLE, 3n],
+      ["settle -> settle sobre otro bounty", MODO_SETTLE, 3n, MODO_SETTLE, 4n],
+      ["settle -> refund sobre el mismo bounty", MODO_SETTLE, 3n, MODO_REFUND, 3n],
+      ["settle -> refund sobre otro bounty", MODO_SETTLE, 3n, MODO_REFUND, 1n],
+      ["refund -> refund sobre el mismo bounty", MODO_REFUND, 1n, MODO_REFUND, 1n],
+      ["refund -> refund sobre otro bounty", MODO_REFUND, 1n, MODO_REFUND, 2n],
+      ["refund -> settle sobre el mismo bounty", MODO_REFUND, 1n, MODO_SETTLE, 1n],
+      ["refund -> settle sobre otro bounty", MODO_REFUND, 1n, MODO_SETTLE, 3n],
+    ];
+
+    for (const [descripcion, accionExterna, idExterno, modoReentrada, idObjetivo] of ESCENARIOS) {
+      it(`bloquea la reentrada (${descripcion}) con Reentrancy y conserva los saldos exactos`, async () => {
+        const saldoFeeAntes = await publicClient.getBalance({ address: feeRecipient.account.address });
+        const estadoObjetivoAntes = (await escrow.read.getBounty([idObjetivo])).status;
+
+        await atacante.write.configurarAtaque([modoReentrada, idObjetivo, false]);
+        if (accionExterna === MODO_SETTLE) {
+          await atacante.write.ejecutarSettle([idExterno, EVIDENCIA]);
+        } else {
+          await atacante.write.ejecutarRefund([idExterno]);
+        }
+
+        // La llamada reentrante se disparó al recibir ETH y fue frenada por nonReentrant.
+        assert.equal(await atacante.read.reentradaIntentada(), true);
+        assert.equal(await atacante.read.reentradaExitosa(), false);
+        assert.equal(await atacante.read.errorReentrada(), SELECTOR_REENTRANCY);
+
+        // Los saldos quedan exactamente donde deben estar tras una única operación válida.
+        const comisionEsperada = accionExterna === MODO_SETTLE ? calcularComision(MONTOS[Number(idExterno)]) : 0n;
+        const pagoEsperado = MONTOS[Number(idExterno)] - comisionEsperada;
+
+        assert.equal((await escrow.read.getBounty([idExterno])).status, accionExterna === MODO_SETTLE ? 2 : 3);
+        assert.equal(await atacante.read.totalRecibido(), pagoEsperado);
+        assert.equal(await publicClient.getBalance({ address: atacante.address }), pagoEsperado);
+        assert.equal(
+          (await publicClient.getBalance({ address: feeRecipient.account.address })) - saldoFeeAntes,
+          comisionEsperada,
+        );
+
+        if (idObjetivo !== idExterno) {
+          assert.equal((await escrow.read.getBounty([idObjetivo])).status, estadoObjetivoAntes);
+        }
+        assert.equal(
+          await publicClient.getBalance({ address: escrow.address }),
+          SALDO_INICIAL_ESCROW - MONTOS[Number(idExterno)],
+        );
+      });
+    }
+
+    it("si el atacante propaga el fallo de la reentrada, toda la transferencia revierte con PayoutFailed", async () => {
+      await atacante.write.configurarAtaque([MODO_SETTLE, 4n, true]);
+
+      await assert.rejects(
+        atacante.write.ejecutarSettle([3n, EVIDENCIA]),
+        /PayoutFailed/,
+      );
+
+      assert.equal((await escrow.read.getBounty([3n])).status, 1);
+      assert.equal((await escrow.read.getBounty([4n])).status, 1);
+      assert.equal(await publicClient.getBalance({ address: escrow.address }), SALDO_INICIAL_ESCROW);
+      assert.equal(await publicClient.getBalance({ address: atacante.address }), 0n);
+    });
   });
 });
