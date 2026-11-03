@@ -151,7 +151,7 @@ footer a:hover{color:var(--ink)}
         </div>
         <div>
           <label for="days">Deadline, in days</label>
-          <input id="days" name="days" inputmode="numeric" value="7" required>
+          <input id="days" name="days" inputmode="numeric" value="14" required>
         </div>
       </div>
       <p class="hint">After the deadline, and only if nobody was paid, you can refund yourself.</p>
@@ -180,10 +180,10 @@ footer a:hover{color:var(--ink)}
       <div class="card">
         <h2>After you post it</h2>
         <ol class="steps">
-          <li>Put <b>Bounty: #N</b> in the pull request description, with the number this page gives you.</li>
-          <li>The repository needs <b>mergit.json</b> with the author's wallet, or the author claims their GitHub login on-chain.</li>
+          <li>Point it at an <b>issue</b>. Contributors only write <b>Closes #N</b> in their pull request, and the agent finds the bounty from the issue. They never need the bounty's number.</li>
+          <li>The author needs a <b>wallet the agent can read</b>: one line naming Mergit and their address in their GitHub profile README, or their login claimed on-chain.</li>
           <li>Add the <b>Mergit action</b> to the repository. One step in a workflow.</li>
-          <li>Merge with CI green. The escrow pays.</li>
+          <li><b>Fund first, then merge</b> with CI green. The check <b>mergit/payable</b>, next to the merge button, says whether merging will pay.</li>
         </ol>
       </div>
 
@@ -377,11 +377,18 @@ $("form").addEventListener("submit", async (e) => {
       say(`Bounty <b>#${id}</b> is open with <b>${formatEther(amount)} ETH</b> locked.`, "line ok");
       const box = document.createElement("div");
       box.className = "paste";
-      box.innerHTML = `<span>Put this line in the pull request: <code>Bounty: #${id}</code></span>`;
+      // Si el bounty apunta a un issue, lo que tiene que escribir quien contribuye
+      // es "Closes #N" con el número del issue, que no cambia nunca. El número del
+      // bounty cambia cada vez que se repone, y pedirlo confundía a la gente.
+      const issue = uri.match(/github\.com\/[^/\s]+\/[^/\s]+\/issues\/(\d+)(?![0-9])/i);
+      const linea = issue ? `Closes #${issue[1]}` : `Bounty: #${id}`;
+      box.innerHTML = issue
+        ? `<span>Contributors only need this line in their pull request: <code>${linea}</code></span>`
+        : `<span>Put this line in the pull request: <code>${linea}</code></span>`;
       const copy = document.createElement("button");
       copy.textContent = "copy";
       copy.addEventListener("click", async () => {
-        await navigator.clipboard.writeText(`Bounty: #${id}`);
+        await navigator.clipboard.writeText(linea);
         copy.textContent = "copied";
       });
       box.appendChild(copy);
