@@ -21,6 +21,15 @@ const API = "https://api.github.com";
 const PASSING = new Set(["success", "neutral", "skipped"]);
 /** El estado que escribe el preflight. Ver `readCi`: no es CI. */
 export const PAYABLE_CONTEXT = "mergit/payable";
+/**
+ * El job del propio preflight. `pull_request_target` lo cuelga del commit del
+ * pull request como un check más (comprobado el 3-nov-2026 con un PR de prueba),
+ * así que sin excluirlo: un corte del explorador lo dejaba en rojo y el agente
+ * decía en público "its CI did not pass", y si estaba en curso al mergear, el
+ * agente esperaba un CI que nunca iba a volver a despertarlo. Tiene que coincidir
+ * con `jobs.check.name` en .github/workflows/preflight.yml.
+ */
+export const PREFLIGHT_CHECK = "Can this pull request be paid";
 
 // ───────────────────────────── Entrada ─────────────────────────────
 
@@ -62,7 +71,7 @@ async function readCi(owner, repo, sha) {
     gh(`/repos/${owner}/${repo}/commits/${sha}/status`),
   ]);
 
-  const checks = (runs.check_runs ?? []).map((c) => ({
+  const checks = (runs.check_runs ?? []).filter((c) => c.name !== PREFLIGHT_CHECK).map((c) => ({
     name: c.name,
     status: c.status,
     conclusion: c.conclusion,

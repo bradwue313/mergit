@@ -314,6 +314,19 @@ $("form").addEventListener("submit", async (e) => {
   if (!account) return;
 
   const uri = $("uri").value.trim();
+  // Desde v1.4 el agente solo paga un bounty cuyo enunciado apunte al
+  // repositorio del pull request. Un texto libre bloquearía dinero que ningún PR
+  // puede cobrar, y lo único que quedaría es reembolsarlo al vencer. Se para
+  // antes de firmar.
+  const esIssue = /^(https?:\/\/)?(www\.)?github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+\/?$/i.test(uri);
+  const esRepo = /^(https?:\/\/)?(www\.)?github\.com\/[^/\s]+\/[^/\s#?]+/i.test(uri);
+  if (!esRepo) {
+    say("Point the bounty at a GitHub issue, like <code>https://github.com/owner/repo/issues/7</code>. The agent only pays a pull request in the repository the bounty names, so free text would lock money nobody can claim.", "line err");
+    return;
+  }
+  if (!esIssue && !confirm("This names a repository but not an issue.\n\nWithout an issue, contributors cannot just write \"Closes #N\": they will need the exact line \"Bounty: #N\" with this bounty's number, which changes if you ever refund and fund it again.\n\nLock it anyway?")) {
+    return;
+  }
   const version = $("escrow").value;
   const address = ESCROW[version];
   const abi = version === "v2" ? ABI_V2 : ABI_V1;

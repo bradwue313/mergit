@@ -24,14 +24,23 @@ import {
 const arg = args();
 const metadataURI = arg.value("uri");
 const amount = parseEther(arg.value("amount") ?? "0.0005");
-const days = Number(arg.value("days") ?? 7);
+const days = Number(arg.value("days") ?? 14);
 const send = arg.has("send");
 
 if (!metadataURI) {
-  console.error('uso: node post-bounty.mjs --uri "<referencia del trabajo>" [--amount 0.0005] [--days 7] [--window 0] [--account deployer|developer] [--verifier 0x…] [--send]');
+  console.error('uso: node post-bounty.mjs --uri "<referencia del trabajo>" [--amount 0.0005] [--days 14] [--window 0] [--account deployer|developer] [--verifier 0x…] [--send]');
   console.error('     --window son los segundos de objeción del financiador; solo la v2 del escrow los acepta.');
   console.error('     --account es la cuenta de WALLETS.secret.json que financia. Por defecto, deployer.');
   process.exit(2);
+}
+
+// El agente solo paga un bounty cuyo enunciado apunte al repositorio del pull
+// request. Un texto libre bloquea dinero que nadie puede cobrar. Igual que /post.
+if (!/^(https?:\/\/)?(www\.)?github\.com\/[^/\s]+\/[^/\s#?]+/i.test(metadataURI)) {
+  fail('--uri tiene que ser un enlace de GitHub, mejor a un issue: "https://github.com/owner/repo/issues/7". Con texto libre ningún PR lo puede cobrar.');
+}
+if (!/\/issues\/\d+\/?$/i.test(metadataURI)) {
+  console.log("aviso: --uri no apunta a un issue. Quien contribuya tendrá que escribir la línea exacta `Bounty: #N`, no le bastará con `Closes #N`.\n");
 }
 
 // Quién financia. Por defecto la del agente, que es como se probó la demo. Para

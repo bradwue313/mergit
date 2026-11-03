@@ -54,6 +54,10 @@ concurrency:
 
 jobs:
   check:
+    # ⚠️ Este nombre aparece como check en el commit del pull request, y el agente
+    # lo excluye del CI y de la evidencia **por este texto exacto**
+    # (PREFLIGHT_CHECK en agent/verify.mjs, y en site/p.html). Si se cambia aquí,
+    # hay que cambiarlo allí, o un fallo de este job bloquearía pagos.
     name: Can this pull request be paid
     runs-on: ubuntu-latest
     steps:

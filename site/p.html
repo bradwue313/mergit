@@ -465,8 +465,10 @@ async function reproducirEvidencia(bountyId, uri, hashEnCadena) {
     // `mergit/payable` lo escribe el preflight para el mantenedor y no es CI: el
     // agente lo deja fuera de la evidencia, así que aquí también. Mismo nombre
     // exacto que en agent/verify.mjs, o los hashes dejarían de cuadrar.
+    // Y el job del propio preflight, que GitHub cuelga del commit del PR como un
+    // check más. Mismo nombre exacto que PREFLIGHT_CHECK en agent/verify.mjs.
     const checks = [
-      ...(runs.check_runs ?? []).map((c) => ({ name: c.name, status: c.status, conclusion: c.conclusion })),
+      ...(runs.check_runs ?? []).filter((c) => c.name !== "Can this pull request be paid").map((c) => ({ name: c.name, status: c.status, conclusion: c.conclusion })),
       ...(combined.statuses ?? []).filter((st) => st.context !== "mergit/payable").map((st) => ({ name: st.context, conclusion: st.state })),
     ].sort((a, b) => a.name.localeCompare(b.name));
 
