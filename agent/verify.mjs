@@ -19,6 +19,8 @@ const API = "https://api.github.com";
 // Un check que termina así no bloquea el pago: neutral y skipped significan
 // "no aplica", no "falló". Tratarlos como fallo dejaría sin cobrar trabajo bueno.
 const PASSING = new Set(["success", "neutral", "skipped"]);
+/** El estado que escribe el preflight. Ver `readCi`: no es CI. */
+export const PAYABLE_CONTEXT = "mergit/payable";
 
 // ───────────────────────────── Entrada ─────────────────────────────
 
@@ -65,10 +67,18 @@ async function readCi(owner, repo, sha) {
     status: c.status,
     conclusion: c.conclusion,
   }));
-  const statuses = (combined.statuses ?? []).map((s) => ({
-    name: s.context,
-    conclusion: s.state,
-  }));
+  // `mergit/payable` lo escribe nuestro preflight para avisar al mantenedor, junto
+  // al botón de merge, si mergear va a pagar. **No es CI y no entra en el
+  // veredicto ni en la evidencia:** contarlo haría que "no hay bounty todavía"
+  // se leyera como tests fallidos, y que el hash de evidencia cambiara según
+  // cuándo pasó el preflight. Se excluye por el nombre exacto, no por prefijo,
+  // para no tocar nunca el CI de un repositorio que se llame parecido.
+  const statuses = (combined.statuses ?? [])
+    .filter((s) => s.context !== PAYABLE_CONTEXT)
+    .map((s) => ({
+      name: s.context,
+      conclusion: s.state,
+    }));
 
   if (checks.length === 0 && statuses.length === 0) {
     // Sin señal no se inventa un veredicto. "No hay CI" no es "el CI pasó".

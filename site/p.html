@@ -436,37 +436,60 @@ async function reproducirEvidencia(bountyId, uri, hashEnCadena) {
   // Cadena normal, no plantilla: dentro de una plantilla el \s se queda en "s"
   // y el patron dejaba de casar con nada.
   const exacto = new RegExp("(^|[^0-9A-Za-z])Bounty:\\s*#?" + bountyId + "([^0-9]|$)");
-  const hit = (found.items || []).find((it) => exacto.test(String(it.body || "")));
-  if (!hit) return { ok: false, reason: `no merged pull request in ${owner}/${repo} carries the line Bounty: #${bountyId}` };
+  const candidatos = (found.items || []).filter((it) => exacto.test(String(it.body || ""))).map((it) => it.number);
 
-  const pr = await api(`/repos/${owner}/${repo}/pulls/${hit.number}`);
-  const sha = pr.head?.sha;
-  const [runs, combined] = await Promise.all([
-    api(`/repos/${owner}/${repo}/commits/${sha}/check-runs`),
-    api(`/repos/${owner}/${repo}/commits/${sha}/status`),
-  ]);
-  const checks = [
-    ...(runs.check_runs ?? []).map((c) => ({ name: c.name, status: c.status, conclusion: c.conclusion })),
-    ...(combined.statuses ?? []).map((st) => ({ name: st.context, conclusion: st.state })),
-  ].sort((a, b) => a.name.localeCompare(b.name));
+  // El agente también paga por el issue que el pull request cierra, y entonces
+  // la línea del PR puede nombrar un bounty viejo o ninguno: así cobraron los
+  // bounties #11 y #12 el 3-nov-2026, con PRs que todavía decían #9 y #10. Por
+  // eso entran también los PRs mergeados que cierran el issue del bounty, y
+  // **la evidencia decide**: solo uno puede dar el hash que guardó la cadena.
+  const issue = String(uri || "").match(/github\.com\/[^/\s]+\/[^/#?\s]+\/issues\/(\d+)(?![0-9])/i);
+  if (issue) {
+    const cerrados = await api(`/repos/${owner}/${repo}/pulls?state=closed&per_page=100`);
+    const cierra = new RegExp("\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\b[ \\t:]*#" + issue[1] + "(?![0-9])", "i");
+    for (const p of cerrados || []) {
+      if (p.merged_at && cierra.test(String(p.body || "")) && !candidatos.includes(p.number)) candidatos.push(p.number);
+    }
+  }
+  if (!candidatos.length) return { ok: false, reason: `no merged pull request in ${owner}/${repo} carries the line Bounty: #${bountyId} or closes the issue it funds` };
 
-  const evidence = {
-    repository: `${owner}/${repo}`,
-    pullRequest: hit.number,
-    author: pr.user?.login ?? null,
-    headSha: sha ?? null,
-    mergeCommitSha: pr.merged ? pr.merge_commit_sha : null,
-    mergedAt: pr.merged_at ?? null,
-    baseRef: pr.base?.ref ?? null,
-    checks,
-  };
-  const recalculado = keccak256(toHex(canonical(evidence)));
+  let ultimo = null;
+  for (const numero of candidatos) {
+    const pr = await api(`/repos/${owner}/${repo}/pulls/${numero}`);
+    if (!pr.merged) continue;
+    const sha = pr.head?.sha;
+    const [runs, combined] = await Promise.all([
+      api(`/repos/${owner}/${repo}/commits/${sha}/check-runs`),
+      api(`/repos/${owner}/${repo}/commits/${sha}/status`),
+    ]);
+    // `mergit/payable` lo escribe el preflight para el mantenedor y no es CI: el
+    // agente lo deja fuera de la evidencia, así que aquí también. Mismo nombre
+    // exacto que en agent/verify.mjs, o los hashes dejarían de cuadrar.
+    const checks = [
+      ...(runs.check_runs ?? []).map((c) => ({ name: c.name, status: c.status, conclusion: c.conclusion })),
+      ...(combined.statuses ?? []).filter((st) => st.context !== "mergit/payable").map((st) => ({ name: st.context, conclusion: st.state })),
+    ].sort((a, b) => a.name.localeCompare(b.name));
+
+    const evidence = {
+      repository: `${owner}/${repo}`,
+      pullRequest: numero,
+      author: pr.user?.login ?? null,
+      headSha: sha ?? null,
+      mergeCommitSha: pr.merged ? pr.merge_commit_sha : null,
+      mergedAt: pr.merged_at ?? null,
+      baseRef: pr.base?.ref ?? null,
+      checks,
+    };
+    const recalculado = keccak256(toHex(canonical(evidence)));
+    ultimo = { evidence, url: pr.html_url, recalculado };
+    if (recalculado.toLowerCase() === String(hashEnCadena || "").toLowerCase()) {
+      return { ok: true, ...ultimo };
+    }
+  }
   return {
-    ok: recalculado.toLowerCase() === String(hashEnCadena || "").toLowerCase(),
-    evidence,
-    url: hit.html_url,
-    recalculado,
-    reason: "the pull request does not hash to what the chain recorded, as it looks today",
+    ok: false,
+    ...(ultimo || {}),
+    reason: "no candidate pull request hashes to what the chain recorded, as it looks today",
   };
 }
 

@@ -76,6 +76,35 @@ export async function listBounties() {
   return out;
 }
 
+/**
+ * El evento de pago de un bounty, si existe: a quién, cuánto, con qué evidencia
+ * y en qué transacción. Sirve para reponer un recibo que no llegó a escribirse.
+ */
+export async function settlementOf(address, bountyId) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 8000);
+  try {
+    const r = await fetch(`${EXPLORER}/api/v2/addresses/${address}/logs`, { signal: ctl.signal });
+    if (!r.ok) throw new Error(`explorer answered ${r.status}`);
+    const d = await r.json();
+    for (const it of d.items || []) {
+      if (!it.decoded || !it.decoded.method_call.startsWith("BountySettled")) continue;
+      const p = Object.fromEntries(it.decoded.parameters.map((x) => [x.name, x.value]));
+      if (String(p.bountyId) !== String(bountyId)) continue;
+      return {
+        developer: String(p.developer).toLowerCase(),
+        paidToDeveloper: BigInt(p.paidToDeveloper),
+        protocolFee: BigInt(p.protocolFee),
+        evidenceHash: String(p.evidenceHash).toLowerCase(),
+        tx: it.transaction_hash,
+      };
+    }
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 /** Vivo = ni liquidado ni devuelto, y con plazo por delante. */
 export const isLive = (b, now = Date.now()) => !b.closed && b.deadline * 1000 > now;
 

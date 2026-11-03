@@ -84,7 +84,7 @@ export async function settleBounty({ bountyId, target, developer, send = false }
   }
 
   if (STATUS[bounty.status] !== "Open") {
-    return { ...result, stage: "bounty", ok: false, done: true, reason: `bounty is ${STATUS[bounty.status]}` };
+    return { ...result, stage: "bounty", ok: false, done: true, status: STATUS[bounty.status], reason: `bounty is ${STATUS[bounty.status]}` };
   }
   if (BigInt(bounty.deadline) <= BigInt(Math.floor(Date.now() / 1000))) {
     return { ...result, stage: "bounty", ok: false, reason: "deadline passed; only a refund to the funder is possible" };

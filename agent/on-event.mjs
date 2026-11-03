@@ -28,9 +28,17 @@ import { privateKeyToAccount } from "viem/accounts";
 import { settleBounty } from "./settle.mjs";
 import { escrowAddress } from "./chain.mjs";
 import { resolveWallet, registryAddress } from "./registry.mjs";
-import { listBounties, isLive, closedIssues, bountyForIssue } from "./bounties.mjs";
+import { listBounties, isLive, closedIssues, bountyForIssue, pointsAtIssue, settlementOf } from "./bounties.mjs";
+import { verifyPullRequest } from "./verify.mjs";
 
+// Arriba, con las demás constantes. Estaba al final del fichero, y como el bucle
+// que paga corre en el nivel superior antes de llegar ahí, el 3-nov-2026 el
+// agente pagó dos bounties y se cayó al escribir los recibos: "Cannot access
+// 'SITE' before initialization". El dinero salió; el recibo no.
+const SITE = "https://www.mergit.xyz";
 const API = "https://api.github.com";
+/** Marca invisible del recibo, para saber si ya se escribió. */
+const RECIBO = "<!-- mergit-receipt -->";
 const REPO = process.env.GITHUB_REPOSITORY;
 const TOKEN = process.env.GITHUB_TOKEN;
 const EVENT = process.env.GITHUB_EVENT_NAME;
@@ -124,8 +132,31 @@ for (const pr of prs) {
   let bountyId = null;
   let origen = "";
 
+  // 0 · ¿ya se le pagó? Un PR mergeado recibe más de una corrida: la del merge y
+  //     la del CI de main. La primera paga y cierra el bounty; la segunda ya no
+  //     lo encuentra vivo, y sin este paso comentaba "did not pay" en un PR que
+  //     acababa de cobrar. Se reconoce por la evidencia grabada en el evento de
+  //     pago, que tiene que ser idéntica a la de este PR: repositorio, número,
+  //     autor, commits y CI. Un PR que perdió la carrera no puede coincidir.
+  if (pr.merged_at && catalogo.length) {
+    const cierra = closedIssues(pr.body);
+    const pagados = catalogo.filter((b) => b.closed
+      && (b.id === bountyMatch?.[1] || cierra.some((n) => pointsAtIssue(b.uri, OWNER, NAME, n))));
+    if (pagados.length) {
+      const propia = await verifyPullRequest({ owner: OWNER, repo: NAME, number: pr.number }).catch(() => null);
+      for (const b of propia?.evidenceHash ? pagados : []) {
+        const ev = await settlementOf(escrowAddress(), b.id).catch(() => null);
+        if (ev && ev.evidenceHash === String(propia.evidenceHash).toLowerCase()) {
+          bountyId = b.id;
+          origen = "its own settlement on chain";
+          break;
+        }
+      }
+    }
+  }
+
   // 1 · la línea explícita, si nombra un bounty que sigue vivo y es nuestro
-  if (bountyMatch) {
+  if (!bountyId && bountyMatch) {
     const pedido = catalogo.find((b) => b.id === bountyMatch[1]);
     if (!catalogo.length) {
       bountyId = bountyMatch[1];
@@ -149,8 +180,18 @@ for (const pr of prs) {
       if (r.ambiguous) break;   // con ambigüedad no se sigue probando: se para
     }
     if (!bountyId && intentos.length) {
-      say(`${tag}: ${intentos[intentos.length - 1]}. Not paid.`);
-      if (pr.merged_at) await comment(pr.number, `**Mergit did not pay this pull request.** ${intentos[intentos.length - 1]}.`);
+      const motivo = intentos[intentos.length - 1];
+      say(`${tag}: ${motivo}. Not paid.`);
+      if (pr.merged_at) {
+        // Para el mantenedor, que es quien puede arreglarlo: el contribuidor no
+        // puede lanzar el workflow. El 3-nov-2026 se mergeó antes de reponer el
+        // bounty, y la salida no estaba escrita en ningún sitio.
+        await commentOnce(pr.number, [
+          `**Mergit did not pay this pull request.** ${motivo}.`,
+          ``,
+          `Maintainers: if the bounty is funded after this merge, run the Mergit workflow by hand with this pull request's number (Actions → Mergit → Run workflow), and the agent pays it then. Nothing is lost by merging first.`,
+        ].join("\n"));
+      }
       continue;
     }
   }
@@ -174,7 +215,7 @@ for (const pr of prs) {
   }
   // `paidVia` y no un ternario: decir "from mergit.json" cuando la wallet vino
   // del README de perfil es mentir en el registro de la corrida.
-  say(`${tag}: paying @${author} at ${developer} (${paidVia(who, author)}).`);
+  if (origen !== "its own settlement on chain") say(`${tag}: paying @${author} at ${developer} (${paidVia(who, author)}).`);
 
   const r = await settleBounty({ bountyId, target: { owner: OWNER, repo: NAME, number: pr.number }, developer, send: SEND });
   const v = r.verdict;
@@ -189,7 +230,13 @@ for (const pr of prs) {
   // Esperas: otro evento lo reintentará. Sin comentario, para no ensuciar el PR.
   if (r.stage === "verify" && !v.merged) { say(`${tag}: not merged yet. Waiting.`); continue; }
   if (r.stage === "verify" && v.ciPending) { say(`${tag}: CI still running on \`${v.evidence.headSha.slice(0, 7)}\`. Waiting for green.`); continue; }
-  if (r.done) { say(`${tag}: bounty #${bountyId} is already ${r.status}. Nothing to do.`); continue; }
+  if (r.done) {
+    // La corrida que pagó pudo caerse después de la transacción y antes del
+    // recibo. Ver `reponerRecibo`.
+    if (r.status === "Settled" && pr.merged_at) await reponerRecibo(pr, bountyId, developer, who, author, r);
+    else say(`${tag}: bounty #${bountyId} is already ${r.status}. Nothing to do.`);
+    continue;
+  }
 
   // Rechazos reales: el PR está mergeado pero no se va a pagar.
   if (!r.ok) {
@@ -223,28 +270,11 @@ for (const pr of prs) {
 
   // Pagado.
   say(`${tag}: PAID ${formatEther(r.event.paidToDeveloper)} ETH to ${developer}${r.finalized ? " (finalized after the challenge window)" : ""}. ${r.url}`);
-  await comment(pr.number, [
-    `**Mergit paid this pull request.**`,
-    ``,
-    `| | |`,
-    `|---|---|`,
-    `| Bounty | #${bountyId} |`,
-    `| Paid to | \`${developer}\` — ${paidVia(who, author)} |`,
-    `| Amount | ${formatEther(r.event.paidToDeveloper)} ETH (protocol fee ${formatEther(r.event.protocolFee)} ETH) |`,
-    `| Verified | merged, CI green on head commit \`${v.evidence.headSha.slice(0, 7)}\` |`,
-    `| Evidence hash | \`${r.event.evidenceHash}\` |`,
-    `| Transaction | [${r.tx.slice(0, 10)}…${r.tx.slice(-4)}](${r.url}) on GIWA Sepolia |`,
-    ``,
-    `Your record: ${SITE}/p/${author}`,
-    ``,
-    `Put this in your profile README and it will show what your merged work was paid, read straight from the chain:`,
-    ``,
-    '```markdown',
-    `[![Mergit](${SITE}/badge/${author}.svg)](${SITE}/p/${author})`,
-    '```',
-    ``,
-    `Merge it. Get paid.`,
-  ].join("\n"));
+  await comment(pr.number, recibo({
+    bountyId, developer, via: paidVia(who, author), author,
+    paid: r.event.paidToDeveloper, fee: r.event.protocolFee,
+    headSha: v.evidence.headSha, evidenceHash: r.event.evidenceHash, tx: r.tx, url: r.url,
+  }));
 }
 
 finish();
@@ -310,13 +340,86 @@ async function comment(number, body) {
   }
 }
 
+/**
+ * Comenta solo si ese mismo texto no está ya. Un merge dispara dos corridas, y
+ * el 3-nov-2026 el PR #12 recibió el mismo rechazo dos veces seguidas.
+ */
+async function commentOnce(number, body) {
+  if (!TOKEN) return;
+  try {
+    const previos = await gh(`/repos/${REPO}/issues/${number}/comments?per_page=100`);
+    if ((previos || []).some((c) => String(c.body || "").trim() === body.trim())) return;
+  } catch { /* si no se puede leer, se comenta: mejor repetido que callado */ }
+  await comment(number, body);
+}
+
 function finish() {
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## Mergit\n\n${summary.map((l) => `- ${l}`).join("\n")}\n`);
   process.exit(0);
 }
 
+function recibo({ bountyId, developer, via, author, paid, fee, headSha, evidenceHash, tx, url }) {
+  return [
+    RECIBO,
+    `**Mergit paid this pull request.**`,
+    ``,
+    `| | |`,
+    `|---|---|`,
+    `| Bounty | #${bountyId} |`,
+    `| Paid to | \`${developer}\` — ${via} |`,
+    `| Amount | ${formatEther(paid)} ETH (protocol fee ${formatEther(fee)} ETH) |`,
+    `| Verified | merged, CI green on head commit \`${headSha.slice(0, 7)}\` |`,
+    `| Evidence hash | \`${evidenceHash}\` |`,
+    `| Transaction | [${tx.slice(0, 10)}…${tx.slice(-4)}](${url}) on GIWA Sepolia |`,
+    ``,
+    `Your record: ${SITE}/p/${author}`,
+    ``,
+    `Put this in your profile README and it will show what your merged work was paid, read straight from the chain:`,
+    ``,
+    "```markdown",
+    `[![Mergit](${SITE}/badge/${author}.svg)](${SITE}/p/${author})`,
+    "```",
+    ``,
+    `Merge it. Get paid.`,
+  ].join("\n");
+}
 
-const SITE = "https://www.mergit.xyz";
+/**
+ * Escribe el recibo de un pago que ya ocurrió, si falta y si el pago fue a este
+ * pull request. Que fue a este PR lo dice la cadena: la evidencia grabada en el
+ * evento tiene que ser idéntica a la que el agente acaba de recalcular, y la
+ * wallet, la misma. Un PR que perdió la carrera por el bounty no pasa.
+ */
+async function reponerRecibo(pr, bountyId, developer, who, author, r) {
+  const tag = `#${pr.number}`;
+  const previos = await gh(`/repos/${REPO}/issues/${pr.number}/comments?per_page=100`);
+  const yaEsta = (previos || []).some((c) => {
+    const b = String(c.body || "");
+    return b.includes(RECIBO) || b.startsWith("**Mergit paid this pull request.**");
+  });
+  if (yaEsta) {
+    say(`${tag}: bounty #${bountyId} is already Settled, and its receipt is there. Nothing to do.`);
+    return;
+  }
+  const ev = await settlementOf(escrowAddress(), bountyId).catch(() => null);
+  if (!ev) {
+    say(`${tag}: bounty #${bountyId} is Settled but its event is not indexed yet. Run again in a minute.`);
+    return;
+  }
+  const mismaEvidencia = ev.evidenceHash === String(r.verdict.evidenceHash).toLowerCase();
+  const mismaWallet = ev.developer === String(developer).toLowerCase();
+  if (!mismaEvidencia || !mismaWallet) {
+    say(`${tag}: bounty #${bountyId} was paid, but not for this pull request. Nothing to do.`);
+    return;
+  }
+  const url = `https://sepolia-explorer.giwa.io/tx/${ev.tx}`;
+  say(`${tag}: bounty #${bountyId} was paid to this pull request without a receipt. Writing it now. ${url}`);
+  await comment(pr.number, recibo({
+    bountyId, developer, via: paidVia(who, author), author,
+    paid: ev.paidToDeveloper, fee: ev.protocolFee,
+    headSha: r.verdict.evidence.headSha, evidenceHash: ev.evidenceHash, tx: ev.tx, url,
+  }));
+}
 
 /**
  * De donde salio la direccion que cobro. Son tres fuentes y hay que nombrarlas
