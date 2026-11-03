@@ -284,6 +284,10 @@
     <h3>What gets recorded</h3>
     <p>The agent hashes the full evidence bundle and passes it to the contract, so any payout can be
       audited after the fact against what the agent claimed to have seen.</p>
+    <p>The checks in the bundle are every check run and commit status on the pull request's head
+      commit, with one exception: <code>mergit/payable</code>. Mergit writes that status itself, next to
+      the merge button, to tell the maintainer whether merging will pay. It is not CI, so it is left
+      out of the verdict and out of the hash.</p>
 <pre><span class="c">// evidence preimage — stored off-chain, hash recorded on-chain</span>
 <span class="b">repo</span>:odiseo159-beep/celo-sentinel<span class="k">|</span><span class="b">task</span>:giwa-escrow-demo<span class="k">|</span><span class="b">verifier</span>:mergit-agent-v0
 

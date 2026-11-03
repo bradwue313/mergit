@@ -21,7 +21,16 @@
 #      y coma en la descripción.
 #   3. **No recibe `MERGIT_AGENT_KEY`.** Este workflow no firma nada. Lo único
 #      que hace es leer la cadena y comentar.
-#   4. Permisos: solo `pull-requests: write`.
+#   4. Permisos: `pull-requests: write` para el comentario y `statuses: write`
+#      para `mergit/payable`, el aviso que va junto al botón de merge.
+#
+# ────────────────────────────── Por qué también un cron ────────────────────
+#
+# Lo que decide si un merge paga no vive solo en el pull request: vive en la
+# cadena. Cuando se repone un bounty, ningún pull request cambia y ningún evento
+# dispara este workflow, así que el aviso se quedaría diciendo "no pagará" sobre
+# algo que ya paga. Cada 30 minutos se revisan todos los abiertos. Para no
+# esperar, después de financiar un bounty: Actions → Preflight → Run workflow.
 #
 # El script no instala dependencias: lee la cadena por el explorador y el README
 # por raw.githubusercontent.com.
@@ -30,13 +39,17 @@ name: Preflight
 on:
   pull_request_target:
     types: [opened, edited, reopened, synchronize]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
 
 permissions:
   pull-requests: write
+  statuses: write
 
 # Un comentario por pull request, no uno por empujón.
 concurrency:
-  group: preflight-${{ github.event.pull_request.number }}
+  group: preflight-${{ github.event.pull_request.number || 'all' }}
   cancel-in-progress: true
 
 jobs:
@@ -57,6 +70,9 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # Solo se usa para escribir el estado sobre ese commit. Nunca se hace
+          # checkout de él: ver la regla 1.
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # Por `env`, no dentro del `run`. Ver la regla 2 de arriba.
           PR_BODY: ${{ github.event.pull_request.body }}
           # La wallet del agente de este repositorio. Un bounty que nombre a otro
