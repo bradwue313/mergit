@@ -114,11 +114,19 @@ export async function settleBounty({ bountyId, target, developer, send = false }
   // 4. Liquidar
   const wallet = createWalletClient({ account, chain: giwaSepolia, transport: http() });
   const hash = await wallet.writeContract(request);
+  // A la consola antes de esperar: si la espera se corta, la transacción enviada
+  // queda en el registro de la corrida y se puede seguir a mano.
+  console.log(`tx enviada: ${EXPLORER}/tx/${hash}`);
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  // viem no lanza si la transacción revierte dentro del bloque: devuelve el
+  // recibo con status "reverted". Sin esta comprobación eso se trataba como pago.
+  if (receipt.status !== "success") {
+    return { ...result, stage: "reverted", ok: false, tx: hash, url: `${EXPLORER}/tx/${hash}`, reason: `the settlement transaction ${hash} reverted on chain` };
+  }
   let event = null;
   for (const log of receipt.logs) {
     try {
-      const e = decodeEventLog({ abi: ABI, data: log.data, topics: log.topics });
+      const e = decodeEventLog({ abi: contract.abi, data: log.data, topics: log.topics });
       if (e.eventName === "BountySettled") event = e.args;
     } catch {
       // un log ajeno en el mismo recibo
@@ -164,7 +172,12 @@ async function finalizeBounty({ bountyId, contract, bounty, result, send }) {
 
   const wallet = createWalletClient({ account, chain: giwaSepolia, transport: http() });
   const hash = await wallet.writeContract(request);
+  console.log(`tx enviada: ${EXPLORER}/tx/${hash}`);
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  // Igual que en la liquidación: una transacción revertida no es un pago.
+  if (receipt.status !== "success") {
+    return { ...result, stage: "reverted", ok: false, tx: hash, url: `${EXPLORER}/tx/${hash}`, reason: `the finalize transaction ${hash} reverted on chain` };
+  }
   let event = null;
   for (const log of receipt.logs) {
     try {

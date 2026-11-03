@@ -24,20 +24,32 @@ const ESCROWS = [
 
 const LOGIN_OK = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 
+// Todas las páginas (50 eventos cada una). Con solo la primera, el total de la
+// insignia bajaría cuando el escrow creciera, y se vería como dinero perdido.
 async function logsOf(address) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), 6000);
-  try {
-    const res = await fetch(`${EXPLORER}/api/v2/addresses/${address}/logs`, { signal: ctl.signal });
-    if (!res.ok) throw new Error(String(res.status));
-    const data = await res.json();
-    return (data.items || []).filter((it) => it.decoded).map((it) => {
+  const out = [];
+  let params = null;
+  for (let pagina = 0; pagina < 40; pagina++) {
+    const qs = params ? "?" + new URLSearchParams(params).toString() : "";
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 6000);
+    let data;
+    try {
+      const res = await fetch(`${EXPLORER}/api/v2/addresses/${address}/logs${qs}`, { signal: ctl.signal });
+      if (!res.ok) throw new Error(String(res.status));
+      data = await res.json();
+    } finally {
+      clearTimeout(t);
+    }
+    for (const it of data.items || []) {
+      if (!it.decoded) continue;
       const p = Object.fromEntries(it.decoded.parameters.map((x) => [x.name, x.value]));
-      return { kind: it.decoded.method_call.split("(")[0], block: Number(it.block_number), ...p };
-    });
-  } finally {
-    clearTimeout(t);
+      out.push({ kind: it.decoded.method_call.split("(")[0], block: Number(it.block_number), ...p });
+    }
+    params = data.next_page_params;
+    if (!params) return out;
   }
+  throw new Error("the explorer kept paginating");
 }
 
 /** Qué wallet tiene registrado ese login ahora mismo. */

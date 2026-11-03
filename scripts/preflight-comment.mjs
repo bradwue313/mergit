@@ -34,9 +34,8 @@
 // ⚠️ Lo que decide aquí tiene que ser lo mismo que decide el agente al pagar, y
 // por eso **importa `agent/bounties.mjs` en lugar de repetir la lógica**. Un
 // preflight que contradice al pagador es peor que no tener preflight.
-import { listBounties, isLive, closedIssues, bountyForIssue } from "../agent/bounties.mjs";
+import { listBounties, isLive, closedIssues, bountyForIssue, pointsAtRepo, logsOf, LINEA_BOUNTY } from "../agent/bounties.mjs";
 
-const EXPLORER = "https://sepolia-explorer.giwa.io";
 const REGISTRY = "0x79d44543d20c7c6653f6626687d67d2cd7f2af9c";
 const MARCA = "<!-- mergit-preflight -->";
 const CONTEXTO = "mergit/payable";
@@ -66,16 +65,6 @@ async function gh(path, init) {
   });
   if (!r.ok) throw new Error("GitHub " + r.status + " en " + path);
   return r.status === 204 ? null : r.json();
-}
-
-async function logsOf(address) {
-  const r = await fetch(EXPLORER + "/api/v2/addresses/" + address + "/logs");
-  if (!r.ok) throw new Error("explorador " + r.status);
-  const d = await r.json();
-  return (d.items || []).filter((it) => it.decoded).map((it) => {
-    const p = Object.fromEntries(it.decoded.parameters.map((x) => [x.name, x.value]));
-    return { kind: it.decoded.method_call.split("(")[0], ...p };
-  });
 }
 
 /** La wallet del autor, en el mismo orden que usa el agente antes de pagar. */
@@ -112,6 +101,19 @@ async function registro() {
   return out;
 }
 
+/**
+ * Cómo se nombra un bounty en un comentario nuestro. **Nunca con el texto del
+ * financiador tal cual**: financiar es abierto, y por 1 wei cualquiera podía
+ * meter enlaces, menciones o markdown en los comentarios de este bot. Solo se
+ * muestra un issue de GitHub rearmado por nosotros; lo demás no se muestra.
+ */
+function referencia(uri) {
+  const limpio = String(uri || "").trim().replace(/^https?:\/\//i, "").replace(/^www\./i, "");
+  const i = limpio.match(/^github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)\/issues\/(\d+)(?![0-9])/i);
+  if (!i) return "(reference not shown)";
+  return "for " + (i[1] + "/" + i[2] === owner + "/" + repo ? "#" + i[3] : i[1] + "/" + i[2] + "#" + i[3]);
+}
+
 const si = (t) => "- ✅ " + t;
 const no = (t) => "- ❌ " + t;
 /** Un estado de commit admite 140 caracteres. Lo largo va en el comentario. */
@@ -123,7 +125,7 @@ const corto = (t) => (t.length <= 140 ? t : t.slice(0, 139) + "…");
  * no nombra bounty ni cierra issue es un pull request normal y no lleva estado.
  */
 function revisar({ number, author, body, mios, vivos, porId, nuestro, w }) {
-  const m = String(body || "").match(/^[ \t]*bounty:[ \t]*#?(\d+)[ \t]*$/im);
+  const m = String(body || "").match(LINEA_BOUNTY);
   const cierra = closedIssues(body);
   const filas = [];
   let listo = true;
@@ -132,9 +134,13 @@ function revisar({ number, author, body, mios, vivos, porId, nuestro, w }) {
   // el issue que el pull request cierra.
   let elegido = null;
   let via = "";
+  let ajeno = null;
   if (m && porId.has(m[1])) {
     const b = porId.get(m[1]);
-    if (isLive(b) && nuestro(b)) { elegido = b; via = "line"; }
+    if (isLive(b) && nuestro(b)) {
+      // Igual que el agente: la línea no cobra un bounty financiado para otro repo.
+      if (pointsAtRepo(b.uri, owner, repo)) { elegido = b; via = "line"; } else ajeno = b.id;
+    }
   }
 
   let ambiguo = null;
@@ -169,7 +175,9 @@ function revisar({ number, author, body, mios, vivos, porId, nuestro, w }) {
       ? "This pull request closes #" + cierra.join(", #") + ", but no open bounty points at "
         + (cierra.length === 1 ? "it" : "any of them") + "."
       : "The description has no `Closes #N` line either, so there is no issue to go by.";
-    const linea = m
+    const linea = ajeno
+      ? "**Bounty #" + ajeno + " was funded for other work, not for this repository**, so the line naming it does not count here. "
+      : m
       ? "**Bounty #" + m[1] + " is not open"
         + (porId.has(m[1]) ? " any more: it was settled, refunded, or its deadline passed" : ", and may never have existed on this escrow")
         + ".** "
@@ -192,7 +200,7 @@ function revisar({ number, author, body, mios, vivos, porId, nuestro, w }) {
   // Qué hay abierto, solo cuando el pull request no encontró nada. Con el bounty
   // ya resuelto, enumerar los demás es ruido.
   const abiertos = vivos.length && !elegido
-    ? "\nOpen right now: " + vivos.map((b) => "**bounty #" + b.id + "** for " + (b.uri || "(no reference)")).join(" · ") + ".\n"
+    ? "\nOpen right now: " + vivos.map((b) => "**bounty #" + b.id + "** " + referencia(b.uri)).join(" · ") + ".\n"
     : "";
 
   const cuerpo = [
@@ -236,7 +244,9 @@ async function ponerEstado(sha, estado) {
 async function main() {
   // Solo el escrow donde liquida este repositorio. Ver MERGIT_ESCROW arriba.
   const aqui = MERGIT_ESCROW.toLowerCase();
-  const mios = (await listBounties()).filter((b) => b.address.toLowerCase() === aqui);
+  // Un solo escrow, y si no responde, la corrida falla: un aviso basado en una
+  // lista vacía por error diría "no pagará" sobre algo que sí paga.
+  const mios = await listBounties({ address: aqui });
   const porId = new Map(mios.map((b) => [b.id, b]));
   const nuestro = (b) => !MERGIT_VERIFIER || b.verifier === MERGIT_VERIFIER.toLowerCase();
   const vivos = mios.filter((b) => isLive(b) && nuestro(b));

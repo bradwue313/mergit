@@ -23,9 +23,8 @@
 // Mirando solo la línea, un bounty repuesto —que es el caso que hizo falta este
 // vigilante— se vería como un bounty que nadie tomó, justo cuando media docena
 // de personas lo están esperando.
-import { listBounties, isLive, closedIssues, pointsAtIssue } from "../agent/bounties.mjs";
+import { listBounties, isLive, closedIssues, pointsAtIssue, pointsAtRepo, LINEA_BOUNTY } from "../agent/bounties.mjs";
 
-const EXPLORER = "https://sepolia-explorer.giwa.io";
 const MARCA = "<!-- mergit-watchdog -->";
 
 const {
@@ -56,29 +55,19 @@ async function gh(path, init) {
   return r.status === 204 ? null : r.json();
 }
 
-async function logsOf(address) {
-  const r = await fetch(EXPLORER + "/api/v2/addresses/" + address + "/logs");
-  if (!r.ok) throw new Error("explorador " + r.status);
-  const d = await r.json();
-  return (d.items || []).filter((it) => it.decoded).map((it) => {
-    const p = Object.fromEntries(it.decoded.parameters.map((x) => [x.name, x.value]));
-    return { kind: it.decoded.method_call.split("(")[0], ...p };
-  });
-}
-
 async function bountiesVivos() {
-  const aqui = MERGIT_ESCROW.toLowerCase();
-  return (await listBounties()).filter((b) =>
-    b.address.toLowerCase() === aqui && isLive(b)
-    && (!MERGIT_VERIFIER || b.verifier === MERGIT_VERIFIER.toLowerCase()));
+  // Un solo escrow, y si no responde, la corrida falla: GitHub avisa de un cron
+  // que falla, y un vigilante que dice "no hay bounties" porque no pudo leer es
+  // peor que uno que se queja.
+  return (await listBounties({ address: MERGIT_ESCROW })).filter((b) =>
+    isLive(b) && (!MERGIT_VERIFIER || b.verifier === MERGIT_VERIFIER.toLowerCase()));
 }
 
-const reBounty = (id) => new RegExp("^[ \\t]*bounty:[ \\t]*#?" + id + "[ \\t]*$", "im");
-
-/** ¿Este pull request reclama este bounty? Por la línea o por el issue que cierra. */
+/** ¿Este pull request reclama este bounty? Las mismas dos vías que el agente. */
 const reclama = (pr, b) => {
   const body = String(pr.body || "");
-  if (reBounty(b.id).test(body)) return true;
+  const m = body.match(LINEA_BOUNTY);
+  if (m && m[1] === b.id && pointsAtRepo(b.uri, owner, repo)) return true;
   return closedIssues(body).some((n) => pointsAtIssue(b.uri, owner, repo, n));
 };
 
@@ -94,6 +83,18 @@ async function main() {
     if (falta <= umbral && candidatos.length) urgentes.push({ b, candidatos, falta });
   }
 
+  // Un pull request **mergeado** que reclama un bounty que **sigue vivo** es un
+  // pago que se perdió: una corrida cancelada por la cola del workflow, una que
+  // se cayó, o un merge antes de financiar. Nada más lo detecta, porque ningún
+  // evento nuevo va a disparar al agente sobre ese PR.
+  const hace14 = Date.now() - 14 * 86400000;
+  const mergeados = ((await gh("/repos/" + owner + "/" + repo + "/pulls?state=closed&sort=updated&direction=desc&per_page=50")) || [])
+    .filter((p) => p.merged_at && Date.parse(p.merged_at) >= hace14);
+  const sinPagar = [];
+  for (const b of vivos) {
+    for (const p of mergeados.filter((p) => reclama(p, b))) sinPagar.push({ b, p });
+  }
+
   let atascadas = [];
   try {
     const runs = await gh("/repos/" + owner + "/" + repo + "/actions/runs?status=action_required&per_page=50");
@@ -102,6 +103,17 @@ async function main() {
 
   const horas = (ms) => (ms / 3600000).toFixed(1);
   const lineas = [];
+
+  if (sinPagar.length) {
+    lineas.push("### Merged, and the bounty is still open", "");
+    for (const { b, p } of sinPagar) {
+      lineas.push("- **#" + p.number + "** was merged " + String(p.merged_at).slice(0, 16).replace("T", " ")
+        + " UTC and claims **bounty #" + b.id + "**, which is still open. The payment did not happen."
+        + " Run Actions → Mergit → Run workflow with `" + p.number + "`, before the bounty closes in "
+        + horas(b.deadline * 1000 - Date.now()) + " h.");
+    }
+    lineas.push("");
+  }
 
   if (urgentes.length) {
     lineas.push("### Bounties about to expire with work waiting", "");

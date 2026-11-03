@@ -28,7 +28,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { settleBounty } from "./settle.mjs";
 import { escrowAddress } from "./chain.mjs";
 import { resolveWallet, registryAddress } from "./registry.mjs";
-import { listBounties, isLive, closedIssues, bountyForIssue, pointsAtIssue, settlementOf } from "./bounties.mjs";
+import { listBounties, isLive, closedIssues, bountyForIssue, pointsAtIssue, pointsAtRepo, settlementOf, LINEA_BOUNTY } from "./bounties.mjs";
 import { verifyPullRequest } from "./verify.mjs";
 
 // Arriba, con las demás constantes. Estaba al final del fichero, y como el bucle
@@ -109,15 +109,19 @@ const registryFunders = await loadFunders(repoInfo.default_branch);
 // todos los despliegues, y los números se repiten entre uno y otro: hay un
 // bounty #1 en la v1 y otro #1 en la v2. Sin este filtro, resolver un bounty en
 // un escrow y liquidar su número en otro es un pago al bounty equivocado.
-let catalogo = [];
+//
+// ⚠️ **Si no se puede leer, no se hace nada.** Antes, un fallo del explorador
+// dejaba el catálogo vacío y el agente confiaba a ciegas en la línea `Bounty: #N`,
+// sin poder comprobar para qué repositorio se financió ese bounty. Ahora la
+// corrida termina en rojo, sin comentar nada en ningún pull request: es un
+// problema de lectura, no un "no se paga". Se reintenta lanzando el workflow.
+let catalogo;
 try {
-  const donde = escrowAddress().toLowerCase();
-  const todos = await listBounties();
-  catalogo = todos.filter((b) => b.address.toLowerCase() === donde);
-  const fuera = todos.length - catalogo.length;
-  if (fuera) console.log(`(${fuera} bounties quedan fuera: están en otro escrow, y este agente liquida en ${donde})`);
+  catalogo = await listBounties({ address: escrowAddress() });
 } catch (e) {
-  console.log(`(no se pudo leer el catálogo de bounties: ${e.message})`);
+  say(`Mergit: could not read the bounties from the explorer (${e.message}). Nothing was decided and nothing was paid. Re-run this workflow.`);
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## Mergit\n\n${summary.map((l) => `- ${l}`).join("\n")}\n`);
+  process.exit(1);
 }
 const verifier = agentAddress();
 // Quién puede financiar un bounty que este agente liquide. Sin lista, cualquiera,
@@ -127,7 +131,7 @@ const funders = registryFunders;
 for (const pr of prs) {
   const tag = `#${pr.number}`;
   const author = pr.user.login;
-  const bountyMatch = (pr.body ?? "").match(/^\s*bounty:\s*#?(\d+)\s*$/im);
+  const bountyMatch = (pr.body ?? "").match(LINEA_BOUNTY);
 
   let bountyId = null;
   let origen = "";
@@ -155,15 +159,18 @@ for (const pr of prs) {
     }
   }
 
-  // 1 · la línea explícita, si nombra un bounty que sigue vivo y es nuestro
+  // 1 · la línea explícita, si nombra un bounty que sigue vivo, es nuestro y se
+  //     financió para este repositorio. Lo último no se miraba: un PR de un repo
+  //     podía cobrar un bounty financiado para otro que usara el mismo agente.
   if (!bountyId && bountyMatch) {
     const pedido = catalogo.find((b) => b.id === bountyMatch[1]);
-    if (!catalogo.length) {
-      bountyId = bountyMatch[1];
-      origen = "the `Bounty: #N` line";
-    } else if (pedido && isLive(pedido) && (!verifier || pedido.verifier === verifier.toLowerCase())) {
-      bountyId = pedido.id;
-      origen = "the `Bounty: #N` line";
+    if (pedido && isLive(pedido) && (!verifier || pedido.verifier === verifier.toLowerCase())) {
+      if (pointsAtRepo(pedido.uri, OWNER, NAME)) {
+        bountyId = pedido.id;
+        origen = "the `Bounty: #N` line";
+      } else {
+        say(`${tag}: bounty #${pedido.id} was funded for other work (${pedido.uri ? "not this repository" : "no repository named"}), so its line does not count here.`);
+      }
     }
   }
 
@@ -182,6 +189,14 @@ for (const pr of prs) {
     if (!bountyId && intentos.length) {
       const motivo = intentos[intentos.length - 1];
       say(`${tag}: ${motivo}. Not paid.`);
+      // El paso 0 reconoce un pago propio por evidencia idéntica, y la evidencia
+      // incluye el CI: si alguien relanza un check después del pago, deja de
+      // coincidir. Antes de decir en público "no se pagó", se mira si un bounty
+      // de este issue ya le pagó a la wallet de este autor.
+      if (pr.merged_at && await yaCobro(pr, author, bountyMatch, issues)) {
+        say(`${tag}: a bounty for this work was already paid to @${author}'s wallet. Not commenting.`);
+        continue;
+      }
       if (pr.merged_at) {
         // Para el mantenedor, que es quien puede arreglarlo: el contribuidor no
         // puede lanzar el workflow. El 3-nov-2026 se mergeó antes de reponer el
@@ -238,6 +253,11 @@ for (const pr of prs) {
     continue;
   }
 
+  // Revertida en cadena: casi siempre otra corrida liquidó primero. No es un "no
+  // se paga" y no se dice en público; la próxima corrida verá el bounty pagado y
+  // repondrá el recibo si hace falta.
+  if (r.stage === "reverted") { say(`${tag}: ${r.reason}. Not commenting; re-run to check.`); continue; }
+
   // Rechazos reales: el PR está mergeado pero no se va a pagar.
   if (!r.ok) {
     const why =
@@ -245,7 +265,7 @@ for (const pr of prs) {
       r.stage === "verify" ? "its CI did not pass on the head commit" :
       r.reason;
     say(`${tag}: not paid. ${why}.`);
-    await comment(pr.number, `**Mergit did not pay bounty #${bountyId}:** ${why}.`);
+    await commentOnce(pr.number, `**Mergit did not pay bounty #${bountyId}:** ${why}.`);
     continue;
   }
 
@@ -268,13 +288,26 @@ for (const pr of prs) {
     continue;
   }
 
-  // Pagado.
-  say(`${tag}: PAID ${formatEther(r.event.paidToDeveloper)} ETH to ${developer}${r.finalized ? " (finalized after the challenge window)" : ""}. ${r.url}`);
-  await comment(pr.number, recibo({
-    bountyId, developer, via: paidVia(who, author), author,
-    paid: r.event.paidToDeveloper, fee: r.event.protocolFee,
-    headSha: v.evidence.headSha, evidenceHash: r.event.evidenceHash, tx: r.tx, url: r.url,
-  }));
+  // Pagado. Desde aquí el dinero ya se movió, así que **nada de lo que sigue
+  // puede tumbar la corrida**: el 3-nov-2026 se cayó justo aquí y el pago quedó
+  // sin recibo. Si el evento no se pudo leer del recibo de la transacción, se
+  // busca en el explorador; si tampoco, se dice con la transacción y el próximo
+  // intento repone el recibo (ver `reponerRecibo`).
+  try {
+    const ev = r.event ?? await settlementOf(escrowAddress(), bountyId).catch(() => null);
+    if (!ev) {
+      say(`${tag}: PAID in ${r.url}, but the settlement event could not be read yet. Re-run this workflow to write the receipt.`);
+      continue;
+    }
+    say(`${tag}: PAID ${formatEther(ev.paidToDeveloper)} ETH to ${developer}${r.finalized ? " (finalized after the challenge window)" : ""}. ${r.url}`);
+    await comment(pr.number, recibo({
+      bountyId, developer, via: paidVia(who, author), author,
+      paid: ev.paidToDeveloper, fee: ev.protocolFee,
+      headSha: v.evidence.headSha, evidenceHash: ev.evidenceHash, tx: r.tx, url: r.url,
+    }));
+  } catch (e) {
+    say(`${tag}: PAID in ${r.url}, but writing the receipt failed (${e.message}). Re-run this workflow to write it.`);
+  }
 }
 
 finish();
@@ -382,6 +415,25 @@ function recibo({ bountyId, developer, via, author, paid, fee, headSha, evidence
     ``,
     `Merge it. Get paid.`,
   ].join("\n");
+}
+
+/**
+ * ¿Algún bounty ya liquidado de este trabajo (su línea o los issues que cierra)
+ * le pagó a la wallet de este autor? Es más laxo que la evidencia idéntica del
+ * paso 0 y solo sirve para una cosa: **no decir en público "no se pagó" a quien
+ * sí cobró**. Nunca decide un pago.
+ */
+async function yaCobro(pr, author, bountyMatch, issues) {
+  const pagados = catalogo.filter((b) => b.closed
+    && (b.id === bountyMatch?.[1] || issues.some((n) => pointsAtIssue(b.uri, OWNER, NAME, n))));
+  if (!pagados.length) return false;
+  const who = await resolveWallet(author, registry[author.toLowerCase()], TOKEN).catch(() => null);
+  if (!who?.wallet) return false;
+  for (const b of pagados) {
+    const ev = await settlementOf(escrowAddress(), b.id).catch(() => null);
+    if (ev && ev.developer === String(who.wallet).toLowerCase()) return true;
+  }
+  return false;
 }
 
 /**

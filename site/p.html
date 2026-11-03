@@ -494,20 +494,33 @@ async function reproducirEvidencia(bountyId, uri, hashEnCadena) {
 }
 
 /** Eventos decodificados de un escrow. El explorador los entrega ya legibles. */
+// Todas las páginas: el explorador da 50 eventos por página, los más nuevos
+// primero, y un expediente que solo leyera la primera perdería los pagos viejos
+// en cuanto el escrow creciera. Si una página falla, falla todo.
 async function logsOf(address) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), 8000);
-  try {
-    const res = await fetch(`${EXPLORER}/api/v2/addresses/${address}/logs`, { signal: ctl.signal });
-    if (!res.ok) throw new Error(res.status);
-    const data = await res.json();
-    return data.items.filter((it) => it.decoded).map((it) => {
+  const out = [];
+  let params = null;
+  for (let pagina = 0; pagina < 40; pagina++) {
+    const qs = params ? "?" + new URLSearchParams(params).toString() : "";
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    let data;
+    try {
+      const res = await fetch(`${EXPLORER}/api/v2/addresses/${address}/logs${qs}`, { signal: ctl.signal });
+      if (!res.ok) throw new Error(res.status);
+      data = await res.json();
+    } finally {
+      clearTimeout(t);
+    }
+    for (const it of data.items || []) {
+      if (!it.decoded) continue;
       const p = Object.fromEntries(it.decoded.parameters.map((x) => [x.name, x.value]));
-      return { kind: it.decoded.method_call.split("(")[0], tx: it.transaction_hash, block: it.block_number, time: it.block_timestamp, ...p };
-    });
-  } finally {
-    clearTimeout(t);
+      out.push({ kind: it.decoded.method_call.split("(")[0], tx: it.transaction_hash, block: it.block_number, time: it.block_timestamp, ...p });
+    }
+    params = data.next_page_params;
+    if (!params) return out;
   }
+  throw new Error("the explorer kept paginating");
 }
 
 /**
