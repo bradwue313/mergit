@@ -28,14 +28,20 @@ const days = Number(arg.value("days") ?? 7);
 const send = arg.has("send");
 
 if (!metadataURI) {
-  console.error('uso: node post-bounty.mjs --uri "<referencia del trabajo>" [--amount 0.0005] [--days 7] [--window 0] [--send]');
+  console.error('uso: node post-bounty.mjs --uri "<referencia del trabajo>" [--amount 0.0005] [--days 7] [--window 0] [--account deployer|developer] [--verifier 0x…] [--send]');
   console.error('     --window son los segundos de objeción del financiador; solo la v2 del escrow los acepta.');
+  console.error('     --account es la cuenta de WALLETS.secret.json que financia. Por defecto, deployer.');
   process.exit(2);
 }
 
+// Quién financia. Por defecto la del agente, que es como se probó la demo. Para
+// un bounty de verdad conviene `--account developer --verifier <agente>`: si
+// financiador y verificador son la misma cuenta, el verificador se paga a quien
+// quiere con dinero que es suyo, y eso no demuestra nada.
+const cual = arg.value("account") ?? "deployer";
 const secrets = loadSecrets();
-const funderKey = secrets?.deployer?.privateKey;
-if (!funderKey) fail("no encuentro la clave en WALLETS.secret.json");
+const funderKey = secrets?.[cual]?.privateKey;
+if (!funderKey) fail(`no encuentro la clave de "${cual}" en WALLETS.secret.json`);
 
 const funder = privateKeyToAccount(funderKey);
 // En la demo de testnet el financiador y el verificador son la misma cuenta.
