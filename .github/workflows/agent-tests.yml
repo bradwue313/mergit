@@ -1,0 +1,47 @@
+# Las pruebas del agente, sobre cada pull request que lo toca.
+#
+# Va aparte de ci.yml y solo se dispara cuando cambia algo en `agent/`, por la
+# misma regla que está escrita allí: un check verde que no prueba nada es peor
+# que ninguno. Un pull request de contratos no tiene por qué mostrar "Agent
+# tests" en verde sin haber corrido ni uno.
+#
+# Existe para el bounty de la segunda ronda que pide los tests de
+# `agent/bounties.mjs`. Lo escribimos nosotros antes de abrirlo: si lo hiciera
+# quien contribuye, estaría editando el CI que decide si se le paga.
+#
+# Mientras no exista `agent/test/`, `node --test` termina con error: un PR que
+# toque el agente sin tests sale en rojo, que es lo honesto.
+name: Agent tests
+
+on:
+  pull_request:
+    paths:
+      - "agent/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent:
+    name: Agent tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+
+      - name: Install
+        working-directory: agent
+        run: npm ci
+
+      - name: Test
+        working-directory: agent
+        run: node --test test/
